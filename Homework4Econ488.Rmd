@@ -1,0 +1,465 @@
+---
+title: "Homework 4"
+author: "Michael Vargas"
+date: "May 1, 2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(data.table)
+library(systemfit)
+library(lmtest)
+library(sandwich)
+library(tidyr)
+library(Matching)
+library(ggplot2)
+```
+
+
+```{r}
+# 1 A)
+
+setwd("C:\\Users\\micha\\Desktop\\ECON 488 CAUSAL INFERENCE\\Homework4")
+dataPSID <- read.csv("nswpsid.csv")
+
+# Add new columns to data set
+dataPSID$re74sq <- I(dataPSID$re74^2)
+dataPSID$re75sq <- I(dataPSID$re75^2)
+dataPSID$agesq <- I(dataPSID$age^2)
+dataPSID$edusq <- I(dataPSID$edu^2)
+dataPSID$u74black <- dataPSID$u74 * dataPSID$black
+
+# Predict p-scores using LPM and Logit specifications
+model_LPM <- lm(dataPSID$treat ~ dataPSID$age + dataPSID$agesq + dataPSID$edu + dataPSID$edusq
+                + dataPSID$married + dataPSID$nodegree + dataPSID$black + dataPSID$hisp
+                + dataPSID$re74 + dataPSID$re75 + dataPSID$re74sq + dataPSID$re75sq + u74black,
+                data = dataPSID)
+model_Logit <- glm(dataPSID$treat ~ dataPSID$age + dataPSID$agesq + dataPSID$edu + dataPSID$edusq
+                + dataPSID$married + dataPSID$nodegree + dataPSID$black + dataPSID$hisp
+                + dataPSID$re74 + dataPSID$re75 + dataPSID$re74sq + dataPSID$re75sq + u74black,
+                family = binomial(link="logit"),
+                data = dataPSID)
+
+pscore_LPM <- predict(model_LPM, data = dataPSID, type = "response")
+pscore_Logit <- predict(model_Logit, data = dataPSID, type = "response")
+
+dataPSID$lpm_p <- pscore_LPM
+dataPSID$logit_p <- pscore_Logit
+```
+
+B) It looks like there are two distinct clusters of pscores for the LPM specification when plotted against the Logit specification. There is also intense clustering in the lower left corner for the "bottom" group, and light clustering in the top right for the "top" group. This implies that the logit pscores have a smooth distribution, while the LPM pscores cluster into two distinct groups.
+```{r}
+# Plot p-scores
+pscoreGraph <- ggplot(dataPSID, aes(x = logit_p, y = lpm_p, color = logit_p)) +
+               geom_point() + ylab("Estimates of pscore based on LPM") +
+               xlab("Estimates of pscore based on Logit") +
+               ggtitle("LPM vs Logit: Estimates of pscore")
+pscoreGraph
+
+```
+2) We will be matching on pscores, thus we need the range of pscores to be the same for the treated and control groups. This allows us to match units in the treated group with units in the control group that have the same pscore. 1350 total units were dropped, 1344 from the control group, 6  from the treated group. I am not surprised because I expected a lot of pscores to be quite low for the control group, by virtue of the fact those units would have a low probability of being assigned treatment given their predetermined characteristics if they are in fact in the control group.
+```{r}
+# Find max and min of common support
+treatedMax <- max(dataPSID$logit_p[dataPSID$treat == 1])
+treatedMin <- min(dataPSID$logit_p[dataPSID$treat == 1])
+controlMax <- max(dataPSID$logit_p[dataPSID$treat == 0])
+controlMin <- min(dataPSID$logit_p[dataPSID$treat == 0])
+commonSupportMax <- min(treatedMax, controlMax)
+commonSupportMin <- max(treatedMin, controlMin)
+
+# Drop all units outside common support & count number of dropped
+dataPSID$toDrop <- dataPSID$logit_p
+dataPSID$toDrop <- ifelse(dataPSID$toDrop > commonSupportMax 
+                          | dataPSID$toDrop < commonSupportMin, 1, 0)
+numberOfTreatedDropped <- sum(dataPSID$treat == 1 & dataPSID$toDrop == 1)
+numberOfControlDropped <- sum(dataPSID$treat == 0 & dataPSID$toDrop == 1)
+dataPSID_Match <- subset(dataPSID, dataPSID$toDrop != 1)
+
+```
+
+3) We cannot eyeball estimates in each graph, or across graphs. There is a cluster of low pscores in the control graph and a cluster of high pscores in the treatment graph that drag up the regression or drag down the regression, respectively. This means we can not accurately eyeball the difference in heights of the two graphs, or even the difference in starting height and ending height within each graph.
+```{r}
+# A)
+
+plot_data <- subset(dataPSID_Match, dataPSID_Match$re78 < 20000)
+plot_data$treat <- factor(ifelse(plot_data$treat == 1, "Treated", "Control"))
+
+replica <- ggplot(plot_data, aes(x = plot_data$logit_p, y = plot_data$re78)) +
+           facet_grid(~plot_data$treat) + geom_point() + geom_smooth(method = "loess", span = 0.5) +
+           ylab("Real Earnings 1978") + xlab("Propensity Score") +
+           ggtitle("Post-treatment Earnings against Propensity Score") +
+           labs(caption = "Data Source: NSW-PSID1") + theme_bw()
+replica
+```
+4 A) The distribution of pscores amongst the treated and control groups are skewed to the left and right, respectively. The 9th strata for the control group is unoccupied.
+```{r}
+# Split data into stratas
+dataPSID_Match$strata <- .bincode(dataPSID_Match$logit_p, breaks = seq(0, 1, 0.1))
+table(dataPSID_Match[dataPSID_Match$treat == 1,]$strata)
+table(dataPSID_Match[dataPSID_Match$treat == 0,]$strata)
+```
+
+B) Yes. We will be matching units on pscores within each strata in order to eventually estimate the ATE, thus it is critical to test for covariate balance between the control and test groups within each strata. This step is needed to identify potential confounding variable influence within each strata (a.k.a, any systematic differences in predetermined characteristics amongst the treated and control groups within each strata).
+The likelihood ratio test results for each strata are statistically significant at the .1% level. There is evidence that the coefficients added to the last model in each test added predictive power, indicating at least one of them is non-zero. In fact, all the estimates for the coefficients in each SUR estimation were the same, along with their standard errors. This is not surprising because units in each strata have similar predetermined characteristics captured by the pscore, which would mitigate any confounding effects the characteristics would have on the treatment assignment. This would lead to similar SUR coefficient estimates in each strata. 
+```{r}
+# Create data sets for each strata
+strata1 <- subset(dataPSID_Match, dataPSID_Match$strata == 1)
+strata2 <- subset(dataPSID_Match, dataPSID_Match$strata == 2)
+strata3 <- subset(dataPSID_Match, dataPSID_Match$strata == 3)
+strata4 <- subset(dataPSID_Match, dataPSID_Match$strata == 4)
+strata5 <- subset(dataPSID_Match, dataPSID_Match$strata == 5)
+strata6 <- subset(dataPSID_Match, dataPSID_Match$strata == 6)
+strata7 <- subset(dataPSID_Match, dataPSID_Match$strata == 7)
+strata8 <- subset(dataPSID_Match, dataPSID_Match$strata == 8)
+strata9 <- subset(dataPSID_Match, dataPSID_Match$strata == 9)
+strata10 <- subset(dataPSID_Match, dataPSID_Match$strata == 10)
+```
+
+```{r}
+# Test for covariate balance within each populated strata (excluding strata 9)
+
+# Strata 1
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system1Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit1 <- systemfit::systemfit(system1Alt, method = "SUR", data = strata1)
+summary(sur_fit1)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system1Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit1 <- systemfit::systemfit(system1Null, method = "SUR", data=strata1)
+lmtest::lrtest(null_fit1,sur_fit1)
+
+```
+
+```{r}
+# Strata 2
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system2Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit2 <- systemfit::systemfit(system2Alt, method = "SUR", data = strata2)
+summary(sur_fit2)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system2Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit2 <- systemfit::systemfit(system2Null, method = "SUR", data=strata2)
+lmtest::lrtest(null_fit2,sur_fit2)
+```
+
+```{r}
+# Strata 3
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system3Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit3 <- systemfit::systemfit(system3Alt, method = "SUR", data = strata3)
+summary(sur_fit3)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system3Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit3 <- systemfit::systemfit(system3Null, method = "SUR", data=strata3)
+lmtest::lrtest(null_fit3,sur_fit3)
+```
+
+```{r}
+# Strata 4
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system4Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit4 <- systemfit::systemfit(system4Alt, method = "SUR", data = strata4)
+summary(sur_fit4)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system4Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit4 <- systemfit::systemfit(system4Null, method = "SUR", data=strata4)
+lmtest::lrtest(null_fit4,sur_fit4)
+```
+
+```{r}
+# Strata 5
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system5Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit5 <- systemfit::systemfit(system5Alt, method = "SUR", data = strata5)
+summary(sur_fit5)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system5Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit5 <- systemfit::systemfit(system5Null, method = "SUR", data=strata5)
+lmtest::lrtest(null_fit5,sur_fit5)
+```
+
+```{r}
+# Strata 6
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system6Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit6 <- systemfit::systemfit(system6Alt, method = "SUR", data = strata6)
+summary(sur_fit6)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system6Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit6 <- systemfit::systemfit(system6Null, method = "SUR", data=strata6)
+lmtest::lrtest(null_fit6,sur_fit6)
+```
+
+```{r}
+# Strata 7
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system7Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit7 <- systemfit::systemfit(system7Alt, method = "SUR", data = strata7)
+summary(sur_fit7)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system7Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit7 <- systemfit::systemfit(system7Null, method = "SUR", data=strata7)
+lmtest::lrtest(null_fit7,sur_fit7)
+```
+
+```{r}
+# Strata 8
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system8Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit8 <- systemfit::systemfit(system8Alt, method = "SUR", data = strata8)
+summary(sur_fit8)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system8Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit8 <- systemfit::systemfit(system8Null, method = "SUR", data=strata8)
+lmtest::lrtest(null_fit8,sur_fit8)
+```
+
+```{r}
+# Strata 10
+eq1 <- dataPSID_Match$age ~ dataPSID_Match$treat
+eq2 <- dataPSID_Match$edu ~ dataPSID_Match$treat
+eq3 <- dataPSID_Match$married  ~ dataPSID_Match$treat
+eq4 <- dataPSID_Match$nodegree  ~ dataPSID_Match$treat
+eq5 <- dataPSID_Match$black  ~ dataPSID_Match$treat
+eq6 <- dataPSID_Match$hisp  ~ dataPSID_Match$treat
+eq7 <- dataPSID_Match$re74  ~ dataPSID_Match$treat
+eq8 <- dataPSID_Match$re75  ~ dataPSID_Match$treat
+
+system10Alt <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+sur_fit10 <- systemfit::systemfit(system10Alt, method = "SUR", data = strata10)
+summary(sur_fit10)$coefficients[,c("Estimate", "Std. Error", "Pr(>|t|)")]
+
+eq1 <- dataPSID_Match$age ~ 1
+eq2 <- dataPSID_Match$edu ~ 1
+eq3 <- dataPSID_Match$married ~ 1
+eq4 <- dataPSID_Match$nodegree  ~ 1
+eq5 <- dataPSID_Match$black ~ 1
+eq6 <- dataPSID_Match$hisp ~ 1
+eq7 <- dataPSID_Match$re74  ~ 1
+eq8 <- dataPSID_Match$re75 ~ 1
+
+system10Null <- list(eq1 = eq1, eq2 = eq2, eq3 = eq3, eq4 = eq4, eq5 = eq5,
+               eq6 = eq6, eq7 = eq7, eq8 = eq8)
+null_fit10 <- systemfit::systemfit(system10Null, method = "SUR", data=strata10)
+lmtest::lrtest(null_fit10,sur_fit10)
+```
+C) We are multiplying the difference in mean outcomes between the treated and control groups by the probability of being treated in that particular stratum. Via the law of total probability, adding all these terms up from each strata gives us the difference in mean outcomes for the treated, which is the ATT.
+```{r}
+# Create lists to use in for-loop 
+
+treatedColumns <- list(mean(strata1$re78[strata1$treat == 1]),
+                       mean(strata2$re78[strata2$treat == 1]),
+                       mean(strata3$re78[strata3$treat == 1]),
+                       mean(strata4$re78[strata4$treat == 1]),
+                       mean(strata5$re78[strata5$treat == 1]),
+                       mean(strata6$re78[strata6$treat == 1]),
+                       mean(strata7$re78[strata7$treat == 1]),
+                       mean(strata8$re78[strata8$treat == 1]),
+                       mean(strata9$re78[strata9$treat == 1]),
+                       mean(strata10$re78[strata10$treat == 1]))
+
+controlColumns <- list(mean(strata1$re78[strata1$treat == 0]),
+                       mean(strata2$re78[strata2$treat == 0]),
+                       mean(strata3$re78[strata3$treat == 0]),
+                       mean(strata4$re78[strata4$treat == 0]),
+                       mean(strata5$re78[strata5$treat == 0]),
+                       mean(strata6$re78[strata6$treat == 0]),
+                       mean(strata7$re78[strata7$treat == 0]),
+                       mean(strata8$re78[strata8$treat == 0]),
+                       mean(strata9$re78[strata9$treat == 1]),
+                       mean(strata10$re78[strata10$treat == 0]))
+
+# Create variables for ATT estimator
+totalNumberOfTreated <- sum(dataPSID_Match$treat == 1)
+numberOfTreatedPerStrata <- list(sum(strata1$treat == 1),
+                                 sum(strata2$treat == 1),
+                                 sum(strata3$treat == 1),
+                                 sum(strata4$treat == 1),
+                                 sum(strata5$treat == 1),
+                                 sum(strata6$treat == 1),
+                                 sum(strata7$treat == 1),
+                                 sum(strata8$treat == 1),
+                                 sum(strata9$treat == 1),
+                                 sum(strata10$treat == 1))
+estimateATT <- 0
+# ATT estimator
+for(i in 1:10) {
+   estimateATT <- (((treatedColumns[[i]] - controlColumns[[i]]) *
+                   (numberOfTreatedPerStrata[[i]])) + estimateATT)
+}
+#estimateATT <- estimateATT
+estimateATT <- estimateATT  / (totalNumberOfTreated - numberOfTreatedPerStrata[[9]])
+estimateATT
+```
+Part 2: "Fancier Matching" on the PScore
+
+2) Equation (10) describes different matching methods depending on the second term. Since we are matching treated units with control units with similar characteristics, we are using these control units to proxy the counterfactual outcome of the treated units if they were not treated. This means we are estimating the ATT. For NM, we match treated units with control units that have the closest pscore. For RM, we match treated units with control units that have a pscore that fall within a certain bound (or "radius") of the treated units' pscores. For KM, we match every treated unit with a weighted average of all treated units, where the weights grow large the closer in pscore value the treated units are, and grow smaller as the pscore values of the control units become farther from the treated units pscores.
+```{r}
+# Matching
+
+m <- Match(Y = dataPSID$re78, Tr = dataPSID$treat, X = dataPSID$logit_p, CommonSupport = TRUE,
+      estimand = "ATT", M = 1)
+summary(m)
+```
+4) The past two problem sets have essentially been about isolating the causal impact of the offer of job training on post-treatment earnings. The main tool we used was linear regression. In both cases we tested for covariate balance between the treated and control groups in order to identify any systematic differences in predetermined characteristics that may end up confounding the causal effect of the treatment on the outcome. 
+In the PSet#2, we used data from an RCT and we adjusted the regressions by adding covariates and interaction between covariates in order to sharpen the ATE estimate while also controlling for confounding variables. We also discovered that the ATE and the ATE of offering (Intent to Treat Effect) will normally be different unless everyone who is offered training takes training.
+In the PSet#3, we used observational data for the control group while keeping the experimental data for the treated group. This was done to again isolate the ATE from confounders (i.e., by exploiting the large sample size of the observational data of the control group). We began to use more advance regression techniques, such as DID and BA in attempt to isolate the ATE from confounders. We found that even with these more sophisticated regression techniques, getting the ATE proved difficult, as confounding effects were still hard to mitigate even with these different techniques. 
